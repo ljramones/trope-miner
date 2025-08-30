@@ -1,0 +1,19 @@
+/ingester/tropes.db
+/data/TheGirl.txt
+
+*.db.bak*
+/ingester/_attic/
+
+# Python
+__pycache__/
+*.pyc
+
+# SQLite
+*.db*
+!tropes.db        # keep current DB if you want it tracked (or remove this line to ignore)
+out/
+
+# Mac / editor junk
+.DS_Store
+.idea/
+.vscode/

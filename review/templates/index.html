@@ -1,0 +1,66 @@
+{% extends "layout.html" %}
+{% block title %}Trope Review — Index{% endblock %}
+
+{% block body %}
+
+{% if works and works|length %}
+  <h2>Works</h2>
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Author</th>
+        <th class="num">Findings</th>
+        <th class="num">Reviewed</th>
+        <th class="num">Reviewed %</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in works %}
+      {% set f = (w.findings or 0)|int %}
+      {% set r = (w.reviewed or 0)|int %}
+      {% set pct = (100.0 * r / f) if f > 0 else 0 %}
+      <tr>
+        <td><a href="{{ url_for('work', work_id=w.id) }}">{{ w.title or w.id }}</a></td>
+        <td>{{ w.author or "—" }}</td>
+        <td class="num">{{ f }}</td>
+        <td class="num">{{ r }}</td>
+        <td class="num">{{ '%.0f'|format(pct) }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% elif scenes and scenes|length %}
+  <h2>
+    Scenes — {{ current_work.title or current_work.id }}
+    <small>by {{ current_work.author or "—" }}</small>
+  </h2>
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th class="num">#</th>
+        <th class="num">Chars</th>
+        <th class="num">Findings</th>
+        <th class="num">✓</th>
+        <th class="num">✗</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in scenes %}
+      <tr>
+        <td class="num">{{ s.idx }}</td>
+        <td class="num">{{ s.len }}</td>
+        <td class="num">{{ s.findings }}</td>
+        <td class="num ok">{{ s.accepted }}</td>
+        <td class="num bad">{{ s.rejected }}</td>
+        <td><a class="btn" href="{{ url_for('scene', scene_id=s.id) }}">Review</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p>No works or scenes to review yet.</p>
+{% endif %}
+
+{% endblock %}

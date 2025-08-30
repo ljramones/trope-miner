@@ -1,0 +1,52 @@
+{% extends "layout.html" %}
+{% block title %}Review — Scene {{ scene_idx }}{% endblock %}
+{% block body %}
+
+<div class="page">
+  <aside>
+    <div class="workHdr">{{ title }}</div>
+    <div class="meta">{{ author or "—" }} — Scene #{{ scene_idx }} · offset {{ offset }}</div>
+
+    <div class="toolbar">
+      <label><input type="checkbox" id="toggleAll"> show all highlights</label>
+    </div>
+
+    <div id="findingsList">
+      {% for f in findings %}
+      {% set s = (f.evidence_start or f.start)|int %}
+      {% set e = (f.evidence_end   or f.end)|int %}
+      <div class="card finding"
+           data-fid="{{ f.id }}"
+           data-start="{{ s }}"
+           data-end="{{ e }}"
+           data-trope="{{ f.trope }}"
+           data-conf="{{ '%.2f'|format(f.confidence or 0) }}">
+        <h4>{{ f.trope }} <span class="nums">({{ '%.2f'|format(f.confidence or 0) }})</span></h4>
+        <div class="nums">[{{ s }} – {{ e }}]</div>
+        <div class="btnRow">
+          <button type="button" class="jump"   data-action="jump">Jump</button>
+          <button type="button" class="accept" data-action="accept">Accept</button>
+          <button type="button" class="reject" data-action="reject">Reject</button>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </aside>
+
+  <section class="content">
+    <div class="sceneWrap">
+      <pre id="text" data-offset="{{ offset|int }}">{{ scene_text }}</pre>
+      <!-- NEW: always ship the text so review.js can recover if <pre> is empty -->
+      <script id="scene-text" type="application/json">{{ scene_text|tojson }}</script>
+    </div>
+  </section>
+</div>
+
+<!-- Optional data blobs (safe defaults) -->
+<script id="spans-json" type="application/json">{{ (spans|default([]))|tojson }}</script>
+<script id="scene-json" type="application/json">{{ {
+  "scene_id": scene_id, "work_id": work_id,
+  "title": title, "author": author, "offset": offset|int
+}|tojson }}</script>
+
+{% endblock %}

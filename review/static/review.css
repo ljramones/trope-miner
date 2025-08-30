@@ -1,0 +1,51 @@
+/* === Force the scene pane to render text and not be height-clamped === */
+section.content,
+.sceneWrap {
+    display: block !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    position: relative !important;
+}
+
+/* The actual text block */
+.sceneWrap pre#text {
+    display: block !important;
+    white-space: pre-wrap !important;
+    line-height: 1.5 !important;
+
+    /* common “invisible text” gates */
+    color: #111 !important;
+    -webkit-text-fill-color: #111 !important;
+    background: transparent !important;
+    text-shadow: none !important;
+    filter: none !important;
+    mix-blend-mode: normal !important;
+
+    /* never clamp this block */
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+
+    position: relative !important;
+    z-index: 1 !important;
+}
+
+/* Kill any overlay/mask pseudo-elements that could cover the text */
+.content::before, .content::after,
+.sceneWrap::before, .sceneWrap::after {
+    content: none !important;
+    display: none !important;
+}
+
+/* Highlights */
+mark.hl, mark.trope-hit {
+    background: #fff59d;
+    color: inherit !important;
+}
+
+mark.hl.active {
+    outline: 1px solid #888;
+}

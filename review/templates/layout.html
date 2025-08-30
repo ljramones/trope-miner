@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>{% block title %}Trope Miner — Review{% endblock %}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+    <!-- Base styles first, review overrides second -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v=8) }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='review.css', v=11) }}">
+
+
+    {% block head %}{% endblock %}
+</head>
+<body>
+<header>
+    <a href="{{ url_for('index') }}">Trope Miner — Review</a>
+</header>
+
+<main>
+    {% block body %}{% endblock %}
+</main>
+
+<!-- Base JS and review JS -->
+<script defer src="{{ url_for('static', filename='app.js', v=9) }}"></script>
+<script defer src="{{ url_for('static', filename='review.js', v=12) }}"></script>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>
+
