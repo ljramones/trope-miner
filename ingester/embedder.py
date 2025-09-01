@@ -8,12 +8,16 @@ collection using Ollama's embeddings API (e.g., nomic-embed-text).
 
 Usage
   $ export OLLAMA_BASE_URL=http://localhost:11434
+  # Global collection (default):
   $ python embedder.py \
       --db ./tropes.db \
       --collection trope-miner-v1-cos \
       --model nomic-embed-text \
       --chroma-host localhost --chroma-port 8000 \
       --batch-size 64 --limit 0
+
+  # Per-work collections (one collection per work):
+  $ PER_WORK_COLLECTIONS=1 python embedder.py ...    # or: --per-work-collections
 
 Optionally verify with a query:
   $ python embedder.py --db ./tropes.db --collection trope-miner-v1-cos \
@@ -22,7 +26,8 @@ Optionally verify with a query:
 Notes
   • Canonical text lives in SQLite. Chroma stores vectors + documents + metadata.
   • Idempotent per collection: skips chunks already in embedding_ref.
-  • Safe to re-run; only new chunks are embedded.
+  • Safe to re-run; only new chunks are embedded (per the target collection).
+  • When PER_WORK_COLLECTIONS=1, each work is written to f"{collection}__{work_id}".
 """
 from __future__ import annotations
 
@@ -86,19 +91,37 @@ class ChunkRow:
     text: str
 
 
-def get_unembedded_chunks(conn: sqlite3.Connection, collection: str, limit: int = 0) -> List[ChunkRow]:
+def get_unembedded_chunks(
+    conn: sqlite3.Connection,
+    collection: str,
+    limit: int = 0,
+    work_id: Optional[str] = None,
+) -> List[ChunkRow]:
+    """
+    Return chunks that are NOT stamped in embedding_ref for the given collection.
+    If work_id is provided, restrict to that work.
+    """
     sql = (
         "SELECT c.id, c.work_id, c.scene_id, c.idx, c.char_start, c.char_end, c.text "
         "FROM chunk c LEFT JOIN embedding_ref e "
         "  ON e.chunk_id = c.id AND e.collection = ? "
         "WHERE e.chunk_id IS NULL "
-        "ORDER BY c.rowid ASC "
     )
+    params: List[object] = [collection]
+    if work_id:
+        sql += "AND c.work_id = ? "
+        params.append(work_id)
+    sql += "ORDER BY c.rowid ASC "
     if limit and limit > 0:
         sql += f"LIMIT {int(limit)}"
-    rows = conn.execute(sql, (collection,)).fetchall()
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [ChunkRow(*r) for r in rows]
 
+
+def list_work_ids(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT DISTINCT work_id FROM chunk ORDER BY work_id").fetchall()
+    return [r[0] for r in rows if r[0]]
 
 def mark_embedded(conn: sqlite3.Connection, rows: List[Tuple[str, str, str, int, str]]) -> None:
     """rows: (chunk_id, collection, model, dim, chroma_id)"""
@@ -129,6 +152,68 @@ def get_chroma_collection(host: str, port: int, name: str, space: str = "cosine"
 
 # ----------------------------- Main embed loop --------------------------
 
+def _flush_batch(
+    conn: sqlite3.Connection,
+    coll,
+    collection: str,
+    model: str,
+    ids: List[str],
+    docs: List[str],
+    embs: List[List[float]],
+    metas: List[Dict],
+):
+    """Upsert one prepared batch to Chroma and stamp embedding_ref."""
+    if not ids:
+        return
+
+    # Defensive length check
+    if not (len(ids) == len(embs) == len(metas) == len(docs)):
+        print(f"!! Skipping batch due to length mismatch: ids={len(ids)} embs={len(embs)} metas={len(metas)} docs={len(docs)}")
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
+        return
+
+    # Drop empties
+    quads = [(i, d, e, m) for i, d, e, m in zip(ids, docs, embs, metas) if isinstance(e, list) and len(e) > 0]
+    if not quads:
+        print("!! Skipping batch: empty embeddings")
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
+        return
+
+    ids_f, docs_f, embs_f, metas_f = zip(*quads)
+    dim = len(embs_f[0]) if embs_f else 0
+    if dim <= 0:
+        print("!! Skipping batch: zero-length embedding")
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
+        return
+
+    # Keep only vectors with consistent dimensionality
+    keep = [(i, d, e, m) for (i, d, e, m) in zip(ids_f, docs_f, embs_f, metas_f) if len(e) == dim]
+    if not keep:
+        print("!! Skipping batch: inconsistent dims")
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
+        return
+    ids_f, docs_f, embs_f, metas_f = zip(*keep)
+
+    # Upsert to Chroma
+    try:
+        coll.upsert(
+            ids=list(ids_f),
+            embeddings=list(embs_f),
+            documents=list(docs_f),
+            metadatas=list(metas_f),
+        )
+    except Exception as e:
+        print(f"!! Chroma upsert failed for batch of {len(ids_f)}: {e}")
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
+        return
+
+    # Stamp embedding_ref
+    stamped = [(cid, collection, model, dim, cid) for cid in ids_f]
+    mark_embedded(conn, stamped)
+
+    ids.clear(); embs.clear(); metas.clear(); docs.clear()
+
+
 def embed_and_upsert(
     db_path: str,
     chroma_host: str,
@@ -139,80 +224,86 @@ def embed_and_upsert(
     batch_size: int,
     limit: int,
     space: str,
+    per_work_collections: bool,
 ) -> None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    chunks = get_unembedded_chunks(conn, collection=collection, limit=limit)
-    if not chunks:
-        print("Nothing to embed. All chunks are up-to-date.")
+
+    client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+
+    if per_work_collections:
+        work_ids = list_work_ids(conn)
+        if not work_ids:
+            print("No chunks to embed.")
+            return
+        print(f"Embedding (per-work) using model '{model}' across {len(work_ids)} work(s).")
+        grand_total = 0
+        for w_id in work_ids:
+            coll_name = f"{collection}__{w_id}"
+            coll = get_chroma_collection(chroma_host, chroma_port, coll_name, space=space)
+            rows = get_unembedded_chunks(conn, collection=coll_name, limit=limit, work_id=w_id)
+            if not rows:
+                print(f" .. work={w_id} up-to-date (0 to embed)")
+                continue
+            print(f" .. work={w_id} -> collection '{coll_name}'  (n={len(rows)})")
+
+            ids: List[str] = []
+            docs: List[str] = []
+            embs: List[List[float]] = []
+            metas: List[Dict] = []
+
+            for i, ch in enumerate(rows, 1):
+                try:
+                    emb = embed_text_ollama(ollama_url, model, ch.text)
+                except Exception as e:
+                    print(f"!! Embedding failed for chunk {ch.id[:8]}…: {e}")
+                    continue
+
+                ids.append(ch.id)
+                docs.append(ch.text if isinstance(ch.text, str) else "")
+                embs.append(emb)
+                metas.append({
+                    "chunk_id": ch.id,
+                    "work_id": ch.work_id,
+                    "scene_id": ch.scene_id,
+                    "chunk_idx": ch.idx,
+                    "char_start": ch.char_start,
+                    "char_end": ch.char_end,
+                    "model": model,
+                    "collection": coll_name,
+                })
+
+                if len(ids) >= batch_size:
+                    _flush_batch(conn, coll, coll_name, model, ids, docs, embs, metas)
+                    print(f" .. upserted {i}/{len(rows)}")
+
+            # final flush per work
+            _flush_batch(conn, coll, coll_name, model, ids, docs, embs, metas)
+            print(f" .. done work={w_id} ({len(rows)} new embeddings)")
+            grand_total += len(rows)
+
+        print(f"Done. Embedded {grand_total} chunks across {len(work_ids)} per-work collection(s).")
+        conn.close()
         return
-    print(f"Embedding {len(chunks)} chunks → collection '{collection}' using model '{model}'")
+
+    # -------- Global collection path (original behavior) --------
+    rows = get_unembedded_chunks(conn, collection=collection, limit=limit)
+    if not rows:
+        print("Nothing to embed. All chunks are up-to-date.")
+        conn.close()
+        return
+
+    print(f"Embedding {len(rows)} chunks → collection '{collection}' using model '{model}'")
     coll = get_chroma_collection(chroma_host, chroma_port, collection, space=space)
 
     start_t = time.time()
-    embedded_rows: List[Tuple[str, str, str, int, str]] = []
-
     ids: List[str] = []
     docs: List[str] = []
     embs: List[List[float]] = []
     metas: List[Dict] = []
 
-    def flush():
-        nonlocal ids, docs, embs, metas, embedded_rows
-        if not ids:
-            return
-
-        # Defensive: keep 4-tuples aligned
-        if not (len(ids) == len(embs) == len(metas) == len(docs)):
-            print(f"!! Skipping batch due to length mismatch: ids={len(ids)} embs={len(embs)} metas={len(metas)} docs={len(docs)}")
-            ids.clear(); embs.clear(); metas.clear(); docs.clear()
-            return
-
-        # Drop empties
-        quads = [(i, d, e, m) for i, d, e, m in zip(ids, docs, embs, metas) if isinstance(e, list) and len(e) > 0]
-        if not quads:
-            print("!! Skipping batch: empty embeddings")
-            ids.clear(); embs.clear(); metas.clear(); docs.clear()
-            return
-
-        ids_f, docs_f, embs_f, metas_f = zip(*quads)
-
-        # Ensure consistent dimensionality
-        dim = len(embs_f[0])
-        if dim <= 0:
-            print("!! Skipping batch: zero-length embedding")
-            ids.clear(); embs.clear(); metas.clear(); docs.clear()
-            return
-
-        keep = [(i, d, e, m) for (i, d, e, m) in zip(ids_f, docs_f, embs_f, metas_f) if len(e) == dim]
-        if not keep:
-            print("!! Skipping batch: inconsistent dims")
-            ids.clear(); embs.clear(); metas.clear(); docs.clear()
-            return
-        ids_f, docs_f, embs_f, metas_f = zip(*keep)
-
-        # Upsert to Chroma — include documents and metadata with chunk_id
-        try:
-            coll.upsert(
-                ids=list(ids_f),
-                embeddings=list(embs_f),
-                documents=list(docs_f),
-                metadatas=list(metas_f),
-            )
-        except Exception as e:
-            print(f"!! Chroma upsert failed for batch of {len(ids_f)}: {e}")
-            ids.clear(); embs.clear(); metas.clear(); docs.clear()
-            return
-
-        # Stamp embedding_ref (mark success)
-        stamped = [(cid, collection, model, dim, cid) for cid in ids_f]
-        mark_embedded(conn, stamped)
-        embedded_rows.extend(stamped)
-
-        ids.clear(); embs.clear(); metas.clear(); docs.clear()
-
-    total = len(chunks)
-    for i, ch in enumerate(chunks, 1):
+    total = len(rows)
+    for i, ch in enumerate(rows, 1):
         try:
             emb = embed_text_ollama(ollama_url, model, ch.text)
         except Exception as e:
@@ -234,14 +325,15 @@ def embed_and_upsert(
         })
 
         if len(ids) >= batch_size:
-            flush()
+            _flush_batch(conn, coll, collection, model, ids, docs, embs, metas)
             print(f".. upserted {min(i, total)}/{total}")
 
     # final flush
-    flush()
+    _flush_batch(conn, coll, collection, model, ids, docs, embs, metas)
 
     dur = time.time() - start_t
-    print(f"Done. Embedded {len(embedded_rows)} chunks in {dur:.1f}s → collection '{collection}'.")
+    print(f"Done. Embedded {total} chunks in {dur:.1f}s → collection '{collection}'.")
+    conn.close()
 
 # ----------------------------- Query helper (optional) ------------------
 
@@ -269,11 +361,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--chroma-port", type=int, default=int(os.getenv("CHROMA_PORT", "8000")))
     p.add_argument("--ollama-url", default=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--limit", type=int, default=0, help="0 = all unembedded")
+    p.add_argument("--limit", type=int, default=0, help="0 = all unembedded (per target collection)")
     p.add_argument("--query", help="Optional test query text")
     p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--space", default="cosine", choices=["cosine", "l2", "ip"],
                    help="Vector distance space for the HNSW index (default: cosine)")
+    p.add_argument("--per-work-collections", action="store_true",
+                   default=(os.getenv("PER_WORK_COLLECTIONS", "0").lower() in {"1","true","yes"}),
+                   help="Write embeddings into per-work collections named '<collection>__<work_id>'")
     return p
 
 
@@ -293,6 +388,7 @@ def main():
             batch_size=args.batch_size,
             limit=args.limit,
             space=args.space,
+            per_work_collections=args.per_work_collections,
         )
 
 if __name__ == "__main__":

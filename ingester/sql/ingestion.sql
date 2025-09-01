@@ -105,8 +105,8 @@ CREATE TABLE IF NOT EXISTS trope
     source_url   TEXT,
     aliases      TEXT, -- JSON array
     anti_aliases TEXT, -- JSON array of phrases that should suppress false-positive matches
-    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_trope_name ON trope (name);
 
@@ -164,7 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_tf_trope ON trope_finding (trope_id);
 CREATE INDEX IF NOT EXISTS idx_finding_work ON trope_finding (work_id);
 CREATE INDEX IF NOT EXISTS idx_tf_trope_created ON trope_finding (trope_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tf_verifier_flag ON trope_finding (verifier_flag);
-CREATE INDEX IF NOT EXISTS idx_tf_calib ON trope_finding(calibration_version);
+CREATE INDEX IF NOT EXISTS idx_tf_calib ON trope_finding (calibration_version);
 
 
 -- Relations & examples (optional)
@@ -202,6 +202,33 @@ CREATE TABLE IF NOT EXISTS trope_alias
     PRIMARY KEY (trope_id, alias),
     FOREIGN KEY (trope_id) REFERENCES trope (id) ON DELETE CASCADE
 );
+
+-- ====================================================
+-- Trope families / groups
+-- ====================================================
+CREATE TABLE IF NOT EXISTS trope_group
+(
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS trope_group_member
+(
+    trope_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    PRIMARY KEY (trope_id, group_id),
+    FOREIGN KEY (trope_id) REFERENCES trope (id) ON DELETE CASCADE,
+    FOREIGN KEY (group_id) REFERENCES trope_group (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tgm_group ON trope_group_member (group_id);
+CREATE INDEX IF NOT EXISTS idx_tgm_trope ON trope_group_member (trope_id);
+
+-- Optional helper view: trope_id -> group name
+CREATE VIEW IF NOT EXISTS v_trope_group AS
+SELECT tgm.trope_id, tg.name AS group_name
+FROM trope_group_member tgm
+         JOIN trope_group tg ON tg.id = tgm.group_id;
+
 
 -- ====================================================
 -- Rerank support + sanity (priors that guide the judge)

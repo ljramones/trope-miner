@@ -1,6 +1,10 @@
+Here’s a clean, ready-to-drop-in **RUNME.md** that matches your current pipeline (A+B+C + 2A semantic seeding), plus optional heatmap & co-occurrence steps.
+
+---
+
 # RUNME.md — Trope Miner (One-Shot Ingest + Review)
 
-This doc shows how to run the full pipeline end-to-end and how to tweak it with environment variables. It covers the “A+B+C” improvements:
+This doc shows how to run the full pipeline end-to-end and how to tweak it with environment variables. It covers:
 
 * **A**: span verification & tightening
 * **B**: negation / anti-pattern handling (seed-time + verify pass)
@@ -97,7 +101,7 @@ python app.py
 
 | Variable            | Default | Purpose                                                                   |
 | ------------------- | ------- | ------------------------------------------------------------------------- |
-| `SEM_TAU`           | `0.70`  | Min similarity (1 − distance) for keeping a semantic seed.                |
+| `SEM_TAU`           | `0.70`  | Min similarity (1 − distance) to keep a semantic seed.                    |
 | `SEM_TOP_N`         | `8`     | Top-N chunks pulled per trope from Chroma (filtered to the current work). |
 | `SEM_PER_SCENE_CAP` | `3`     | Cap seeds per (trope, scene) to avoid clutter.                            |
 
@@ -187,6 +191,27 @@ THRESHOLD=0.62 ./runingest.sh
 
 ---
 
+## Optional analytics & viz
+
+**Heatmap (scenes × top-20 tropes)**
+
+```bash
+python scripts/heatmap.py --db ./tropes.db --work-id <WORK_UUID> \
+  --csv out/heatmap.csv --png out/heatmap.png --top 20
+```
+
+**Co-occurrence graph (CSV / GraphML / PNG)**
+
+```bash
+python scripts/cooccur.py --db ./tropes.db --work-id <WORK_UUID> \
+  --threshold 0.55 \
+  --out-csv out/cooccur.csv \
+  --out-graphml out/cooccur.graphml \
+  --png out/cooccur.png --top-n 20 --min-weight 2
+```
+
+---
+
 ## Makefile helpers (optional)
 
 From `ingester/`, you can also use:
@@ -195,14 +220,20 @@ From `ingester/`, you can also use:
 # Boundary seeding
 gmake seed-boundary DB=./tropes.db WORK_ID=<WORK_UUID>
 
-# Semantic seeding (if you added the target)
+# Semantic seeding
 gmake seed-semantic DB=./tropes.db WORK_ID=<WORK_UUID> TAU=0.72 TOP_N=10 PER_SCENE_CAP=2
 
 # Judge only (reuse existing candidates)
 gmake judge DB=./tropes.db WORK_ID=<WORK_UUID>
+
+# Heatmap
+gmake heatmap DB=./tropes.db WORK_ID=<WORK_UUID>
+
+# Co-occurrence
+gmake cooccur DB=./tropes.db WORK_ID=<WORK_UUID>
 ```
 
-> If you haven’t added `seed-semantic` to your Makefile yet, copy the target from the semantic seeding script instructions.
+> If a target is missing, copy the target stanza from each script’s header into your `Makefile`.
 
 ---
 
@@ -228,28 +259,21 @@ curl -X POST http://127.0.0.1:5050/api/edit_span \
 
 ## Troubleshooting
 
-* **“unable to open database file”**
-  Run from `ingester/` and ensure write permissions.
-
-* **Chroma connection errors**
-  Confirm Chroma is running and `CHROMA_HOST`/`CHROMA_PORT` are correct.
-
-* **Ollama empty embedding / model not found**
-  Pull or run the models you selected (`EMB_MODEL`, `REASONER_MODEL`) and confirm `OLLAMA_BASE_URL`.
-
-* **Semantic seeding returns zero**
-  Lower `SEM_TAU` (e.g., 0.65), raise `SEM_TOP_N`, or confirm `CHUNK_COLL` and per-work filtering are correct.
-
-* **No calibration output**
-  Accept/reject at least a handful of findings in the Review UI; the script detects labels automatically.
+* **“unable to open database file”** — Run from `ingester/` and ensure write permissions.
+* **Chroma connection errors** — Confirm Chroma is running and `CHROMA_HOST`/`CHROMA_PORT` are correct.
+* **Ollama empty embedding / model not found** — Pull or run the models (`EMB_MODEL`, `REASONER_MODEL`) and confirm `OLLAMA_BASE_URL`.
+* **Semantic seeding returns zero** — Lower `SEM_TAU` (e.g., 0.65), raise `SEM_TOP_N`, or confirm `CHUNK_COLL` and per-work filtering.
+* **No calibration output** — Accept/reject at least a handful of findings in the Review UI; the script detects labels automatically.
 
 ---
 
 ## Outputs
 
 * `out/findings.csv` — machine findings after A+B adjustments
-* `out/report_<WORK_ID>.html` — per-work HTML with highlighted spans
+* `out/report_<WORK_ID>.html` — per-work HTML with highlighted spans (links & group colors if present)
 * `out/support_<WORK_ID>.md` — support/sanity snapshot (best effort)
+* `out/heatmap.csv` / `out/heatmap.png` — scene × trope heatmap (optional)
+* `out/cooccur.csv` / `out/cooccur.graphml` / `out/cooccur.png` — co-occurrence graph (optional)
 * `out/calibration.csv` & `out/calibration.png` — only when labels exist
 
 ---

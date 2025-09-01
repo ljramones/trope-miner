@@ -52,6 +52,15 @@ except Exception:
 
 # ----------------------------- Small helpers ----------------------------
 
+def load_trope_thresholds(conn: sqlite3.Connection) -> Dict[str, float]:
+    """Return {trope_id: threshold} from trope_thresholds if present, else {}."""
+    try:
+        rows = conn.execute("SELECT trope_id, threshold FROM trope_thresholds").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+
+
 def get_table_columns(conn: sqlite3.Connection, table: str) -> set:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {r[1] for r in rows}  # column name at index 1
@@ -314,6 +323,357 @@ def _wire_env_for_rerank(
     # Respect existing RERANK_KEEP_M if explicitly set; else default
     os.environ.setdefault("RERANK_KEEP_M", str(keep_m_default))
 
+    def _ensure_run_schema(conn: sqlite3.Connection) -> None:
+        """Create run table and add run_id column on trope_finding if missing."""
+        conn.execute("""
+                     CREATE TABLE IF NOT EXISTS run
+                     (
+                         id
+                         TEXT
+                         PRIMARY
+                         KEY,
+                         created_at
+                         TEXT
+                         DEFAULT (
+                         strftime
+                     (
+                         '%Y-%m-%dT%H:%M:%fZ',
+                         'now'
+                     )),
+                         params_json TEXT
+                         );""")
+        # add run_id to trope_finding if not present
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trope_finding)")}
+        if "run_id" not in cols:
+            try:
+                conn.execute("ALTER TABLE trope_finding ADD COLUMN run_id TEXT")
+            except sqlite3.OperationalError:
+                # Back-compat / concurrent migration — ignore if another process added it
+                pass
+        conn.commit()
+
+    def _capture_run_params(
+            *,
+            work_id: str,
+            collection: str,
+            chroma_host: str,
+            chroma_port: int,
+            embed_model: str,
+            reasoner_model: str,
+            ollama_url: str,
+            top_k: int,
+            threshold: float,
+            trope_collection: str,
+            trope_top_k: int,
+    ) -> dict:
+        """Collect args + selected env knobs for reproducibility."""
+        env_keys = [
+            "RERANK_TOP_K", "RERANK_KEEP_M", "DOWNWEIGHT_NO_MENTION", "SEM_SIM_THRESHOLD",
+            "CHUNK_COLLECTION", "TROPE_COLLECTION", "CHROMA_HOST", "CHROMA_PORT",
+            "EMB_MODEL", "REASONER_MODEL", "OLLAMA_BASE_URL", "TROPE_TOP_K",
+            "PER_WORK_COLLECTIONS", "CHROMA_SPACE", "RERANK_DOC_CHAR_MAX"
+        ]
+        return {
+            "work_id": work_id,
+            "args": {
+                "collection": collection,
+                "chroma_host": chroma_host,
+                "chroma_port": chroma_port,
+                "embed_model": embed_model,
+                "reasoner_model": reasoner_model,
+                "ollama_url": ollama_url,
+                "top_k": top_k,
+                "threshold": threshold,
+                "trope_collection": trope_collection,
+                "trope_top_k": trope_top_k,
+            },
+            "env": {k: os.getenv(k) for k in env_keys if os.getenv(k) is not None},
+        }
+
+import os, uuid, json, sqlite3
+from typing import List, Dict, Tuple, Optional
+
+# ---------- tiny utilities / schema helpers ----------
+
+def _table_has_col(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    try:
+        return col in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.OperationalError:
+        return False
+
+def _ensure_run_schema(conn: sqlite3.Connection) -> None:
+    """Create run table and add run_id to trope_finding if missing (back-compat safe)."""
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS run(
+      id TEXT PRIMARY KEY,
+      created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      params_json TEXT
+    );
+    """)
+    if not _table_has_col(conn, "trope_finding", "run_id"):
+        try:
+            conn.execute("ALTER TABLE trope_finding ADD COLUMN run_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+
+def _capture_run_params(
+    *, work_id: str, collection: str, chroma_host: str, chroma_port: int,
+    embed_model: str, reasoner_model: str, ollama_url: str,
+    top_k: int, threshold: float, trope_collection: str, trope_top_k: int
+) -> dict:
+    env_keys = [
+        "RERANK_TOP_K","RERANK_KEEP_M","DOWNWEIGHT_NO_MENTION","SEM_SIM_THRESHOLD",
+        "CHUNK_COLLECTION","TROPE_COLLECTION","CHROMA_HOST","CHROMA_PORT",
+        "EMB_MODEL","REASONER_MODEL","OLLAMA_BASE_URL","TROPE_TOP_K",
+        "PER_WORK_COLLECTIONS","CHROMA_SPACE","RERANK_DOC_CHAR_MAX",
+        "SEM_EMBED_MAX_CHARS"
+    ]
+    return {
+        "work_id": work_id,
+        "args": {
+            "collection": collection,
+            "chroma_host": chroma_host,
+            "chroma_port": chroma_port,
+            "embed_model": embed_model,
+            "reasoner_model": reasoner_model,
+            "ollama_url": ollama_url,
+            "top_k": top_k,
+            "threshold": threshold,
+            "trope_collection": trope_collection,
+            "trope_top_k": trope_top_k,
+        },
+        "env": {k: os.getenv(k) for k in env_keys if os.getenv(k) is not None},
+    }
+
+def _load_per_trope_thresholds(conn: sqlite3.Connection) -> Dict[str, float]:
+    """If learn_thresholds has run, load per-trope thresholds; else empty dict."""
+    try:
+        rows = conn.execute("SELECT trope_id, threshold FROM trope_thresholds").fetchall()
+        d = {r[0]: float(r[1]) for r in rows if r[1] is not None}
+        if d:
+            print(f"[judge] using {len(d)} per-trope thresholds")
+        return d
+    except sqlite3.OperationalError:
+        return {}
+
+def _list_scenes(conn: sqlite3.Connection, work_id: str):
+    return conn.execute(
+        "SELECT s.id, s.idx, s.char_start, s.char_end, w.norm_text "
+        "FROM scene s JOIN work w ON w.id = s.work_id "
+        "WHERE s.work_id=? ORDER BY s.idx",
+        (work_id,)
+    ).fetchall()
+
+def _gazetteer_candidates(conn: sqlite3.Connection, work_id: str, scene_id: str) -> List[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT trope_id FROM trope_candidate WHERE work_id=? AND scene_id=?",
+        (work_id, scene_id)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+def _semantic_shortlist_from_catalog(
+    conn: sqlite3.Connection,
+    scene_text: str,
+    chroma_host: str,
+    chroma_port: int,
+    trope_collection: str,
+    ollama_url: str,
+    embed_model: str,
+    trope_top_k: int,
+    max_chars: int,
+) -> List[str]:
+    scene_for_sem = scene_text if len(scene_text) <= max_chars else scene_text[:max_chars]
+    try:
+        q_emb = embed_text(ollama_url, embed_model, scene_for_sem)
+    except Exception as ex:
+        print(f"[judge] warn: catalog embed failed (len={len(scene_text)} trimmed={len(scene_for_sem)}): {ex}")
+        return []
+    if not q_emb:
+        return []
+    try:
+        tcoll = get_chroma_collection(chroma_host, chroma_port, trope_collection)
+        tres = tcoll.query(query_embeddings=[q_emb], n_results=trope_top_k, include=["metadatas"])
+        return [(tres.get("ids") or [[]])[0] or []][0]
+    except Exception as ex:
+        print(f"[judge] warn: catalog query failed: {ex}")
+        return []
+
+def _collect_support_texts(conn: sqlite3.Connection, support_ids: List[str]) -> List[str]:
+    if not support_ids:
+        return []
+    rows = conn.execute(
+        f"SELECT c.id, c.text, c.char_start, c.char_end, c.work_id "
+        f"FROM chunk c WHERE c.id IN ({','.join(['?']*len(support_ids))})",
+        tuple(support_ids)
+    ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    out: List[str] = []
+    for cid in support_ids:
+        r = by_id.get(cid)
+        if not r:
+            continue
+        txt = (r[1] or "").strip()
+        if not txt:
+            W = conn.execute("SELECT norm_text FROM work WHERE id=?", (r[4],)).fetchone()
+            if W and W[0]:
+                cs, ce = int(r[2]), int(r[3])
+                txt = W[0][cs:ce]
+        if txt:
+            out.append(txt[:480])
+    return out
+
+def _fetch_support_meta(conn: sqlite3.Connection, scene_id: str, support_ids: List[str]) -> Dict[str, dict]:
+    if not support_ids:
+        return {}
+    try:
+        ss_cols = get_table_columns(conn, "support_selection")
+    except Exception:
+        return {}
+    fields = ["chunk_id"]
+    has_stage1 = "stage1_score" in ss_cols
+    has_stage2 = "stage2_score" in ss_cols
+    has_rank   = "rank" in ss_cols
+    if has_stage1: fields.append("stage1_score")
+    if has_stage2: fields.append("stage2_score")
+    if has_rank:   fields.append("rank")
+    q = f"SELECT {','.join(fields)} FROM support_selection WHERE scene_id=? AND chunk_id IN ({','.join(['?']*len(support_ids))})"
+    params = (scene_id,) + tuple(support_ids)
+    rows = conn.execute(q, params).fetchall()
+    out: Dict[str, dict] = {}
+    for row in rows:
+        idx = 0
+        cid = row[idx]; idx += 1
+        meta = {}
+        if has_stage1: meta["stage1_score"] = row[idx]; idx += 1
+        if has_stage2: meta["stage2_score"] = row[idx]; idx += 1
+        if has_rank:   meta["rank"]         = row[idx]; idx += 1
+        out[cid] = meta
+    return out
+
+def _build_defs_block(conn: sqlite3.Connection, avail_ids: List[str], weights: Dict[str, float]) -> List[str]:
+    if not avail_ids:
+        return []
+    qmarks = ",".join(["?"] * len(avail_ids))
+    rows = conn.execute(f"SELECT id, name, summary FROM trope WHERE id IN ({qmarks})", tuple(avail_ids)).fetchall()
+    defs = []
+    for tid, name, summary in rows:
+        w = float(weights.get(tid, 1.0))
+        defs.append(f"- {tid} :: {name} — {summary or ''}  (PRIOR={w:.2f})")
+    return defs
+
+def _build_support_block(support_ids: List[str], support_texts: List[str], support_meta: Dict[str, dict]) -> str:
+    lines = []
+    for i, cid in enumerate(support_ids or []):
+        txt = support_texts[i] if i < len(support_texts) else ""
+        meta = support_meta.get(cid, {})
+        parts = []
+        try:
+            if meta.get("stage1_score") is not None:
+                parts.append(f"KNN={float(meta['stage1_score']):.2f}")
+        except Exception:
+            pass
+        try:
+            if meta.get("stage2_score") is not None:
+                parts.append(f"RERANK={float(meta['stage2_score']):.2f}")
+        except Exception:
+            pass
+        try:
+            if meta.get("rank") is not None:
+                parts.append(f"rank={int(meta['rank'])}")
+        except Exception:
+            pass
+        tag = f"[{cid[:8]}{(' ' + ', '.join(parts)) if parts else ''}]"
+        lines.append(f"{tag}\n{txt}")
+    return "\n\nSupport snippets (chosen via rerank):\n" + ("\n---\n".join(lines) if lines else "(none)")
+
+def _insert_findings(
+    conn: sqlite3.Connection,
+    items: List[dict],
+    weights: Dict[str, float],
+    per_trope_thr: Dict[str, float],
+    default_thr: float,
+    reasoner_model: str,
+    run_id: Optional[str],
+    work_id: str,
+    scene_id: str,
+    s: int,
+    e: int,
+    full_text: str,
+) -> int:
+    if not items:
+        return 0
+    cols = get_table_columns(conn, "trope_finding")
+    has_level  = "level"  in cols
+    has_run_id = "run_id" in cols
+    inserted = 0
+    for it in items:
+        try:
+            tid = it["trope_id"]
+            raw_conf = float(it.get("confidence", 0.0))
+            w = float(weights.get(tid, 1.0))
+            adj_conf = max(0.0, min(1.0, raw_conf * w))
+            thr = float(per_trope_thr.get(tid, default_thr))
+            if adj_conf < thr:
+                continue
+
+            # clamp spans to valid range (absolute into work.norm_text)
+            span = it.get("evidence_char_span") or [s, e]
+            ev_s, ev_e = int(span[0]), int(span[1])
+            N = len(full_text)
+            ev_s = max(0, min(ev_s, N))
+            ev_e = max(0, min(ev_e, N))
+            if ev_e < ev_s:
+                ev_s, ev_e = ev_e, ev_s
+
+            rationale = (it.get("rationale", "") or "").strip()
+            if w != 1.0:
+                rationale = (rationale + f" [prior={w:.2f}, raw={raw_conf:.2f}, adj={adj_conf:.2f}]").strip()
+
+            fid = str(uuid.uuid4())
+            if has_level and has_run_id:
+                conn.execute(
+                    "INSERT OR REPLACE INTO trope_finding("
+                    " id, work_id, scene_id, chunk_id, trope_id, level, confidence,"
+                    " evidence_start, evidence_end, rationale, model, run_id)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (fid, work_id, scene_id, None, tid, "scene", adj_conf,
+                     ev_s, ev_e, rationale, reasoner_model, run_id)
+                )
+            elif has_level:
+                conn.execute(
+                    "INSERT OR REPLACE INTO trope_finding("
+                    " id, work_id, scene_id, chunk_id, trope_id, level, confidence,"
+                    " evidence_start, evidence_end, rationale, model)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (fid, work_id, scene_id, None, tid, "scene", adj_conf,
+                     ev_s, ev_e, rationale, reasoner_model)
+                )
+            elif has_run_id:
+                conn.execute(
+                    "INSERT OR REPLACE INTO trope_finding("
+                    " id, work_id, scene_id, chunk_id, trope_id, confidence,"
+                    " evidence_start, evidence_end, rationale, model, run_id)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (fid, work_id, scene_id, None, tid, adj_conf,
+                     ev_s, ev_e, rationale, reasoner_model, run_id)
+                )
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO trope_finding("
+                    " id, work_id, scene_id, chunk_id, trope_id, confidence,"
+                    " evidence_start, evidence_end, rationale, model)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (fid, work_id, scene_id, None, tid, adj_conf,
+                     ev_s, ev_e, rationale, reasoner_model)
+                )
+            inserted += 1
+        except Exception as ex:
+            print(f"[judge] scene={scene_id[:8]} skip item due to error: {ex}; item={it}")
+            continue
+    return inserted
+
+# ---------- main orchestration (refactored) ----------
 
 def judge_scenes(
     conn: sqlite3.Connection,
@@ -334,10 +694,25 @@ def judge_scenes(
       - Build a candidate trope list (gazetteer + semantic shortlist).
       - Choose 2–3 support snippets via per-work KNN → LLM rerank.
       - Compute sanity weights (lexical + semantic) BEFORE judging.
-      - Prompt the LLM with scene + support + candidate defs + prior weights.
-      - Insert findings using adjusted confidence: adj = raw * weight.
+      - Prompt the LLM with scene + support (+ KNN/RERANK scores) + candidate defs + prior weights.
+      - Insert findings using adjusted confidence: adj = raw * weight, gated by per-trope threshold when available.
+      - Stamp a 'run' row and tag each finding with run_id (for reproducibility).
     """
     ensure_indexes(conn)
+
+    # Run stamping (repro)
+    _ensure_run_schema(conn)
+    run_id = str(uuid.uuid4())
+    params = _capture_run_params(
+        work_id=work_id, collection=collection,
+        chroma_host=chroma_host, chroma_port=chroma_port,
+        embed_model=embed_model, reasoner_model=reasoner_model, ollama_url=ollama_url,
+        top_k=top_k, threshold=threshold, trope_collection=trope_collection, trope_top_k=trope_top_k,
+    )
+    conn.execute("INSERT OR REPLACE INTO run(id, params_json) VALUES(?,?)",
+                 (run_id, json.dumps(params, ensure_ascii=False)))
+    conn.commit()
+    print(f"==> RUN_ID={run_id}")
 
     # Make sure the reranker sees the same runtime settings
     _wire_env_for_rerank(
@@ -351,67 +726,38 @@ def judge_scenes(
         keep_m_default=3,
     )
 
-    # list scenes (ordered)
-    scenes = conn.execute(
-        "SELECT s.id, s.idx, s.char_start, s.char_end, w.norm_text "
-        "FROM scene s JOIN work w ON w.id = s.work_id "
-        "WHERE s.work_id=? ORDER BY s.idx",
-        (work_id,)
-    ).fetchall()
+    per_trope_thr = _load_per_trope_thresholds(conn)
 
-    # candidate aliases (fallback if no trope_candidate rows yet)
+    scenes = _list_scenes(conn, work_id)
     aliases = load_aliases(conn)
     _idset, _name2id = build_trope_lookup(conn)
 
     inserted = 0
-
-    # schema probe
-    finding_cols = get_table_columns(conn, "trope_finding")
-    has_level = "level" in finding_cols
-
-    # max chars used when embedding a scene for the trope catalog query
     SEM_EMBED_MAX = int(os.getenv("SEM_EMBED_MAX_CHARS", "4000"))
 
     for scene_id, idx, s, e, full_text in scenes:
         scene_text = full_text[s:e]
 
-        # --- 1) Candidate shortlist (gazetteer) ----------------------------
-        cands = conn.execute(
-            "SELECT DISTINCT trope_id FROM trope_candidate WHERE work_id=? AND scene_id=?",
-            (work_id, scene_id)
-        ).fetchall()
-        cand_ids = {row[0] for row in cands}
-        if not cand_ids:  # fallback lexical scan in-scene
+        # -- candidate shortlist (gazetteer + semantic catalog) --
+        cand_ids = set(_gazetteer_candidates(conn, work_id, scene_id))
+        if not cand_ids:  # fallback lexical pass
             for ap in aliases:
                 if ap.pattern.search(scene_text):
                     cand_ids.add(ap.trope_id)
+        ids_from_catalog = _semantic_shortlist_from_catalog(
+            conn, scene_text, chroma_host, chroma_port, trope_collection,
+            ollama_url, embed_model, trope_top_k, SEM_EMBED_MAX
+        )
+        for tid in (ids_from_catalog or []):
+            if tid:
+                cand_ids.add(tid)
 
-        # --- 2) Semantic shortlist from trope catalog (robust) -------------
-        scene_for_sem = scene_text if len(scene_text) <= SEM_EMBED_MAX else scene_text[:SEM_EMBED_MAX]
-        q_emb = None
-        try:
-            q_emb = embed_text(ollama_url, embed_model, scene_for_sem)
-        except Exception as ex:
-            print(f"[judge] warn: catalog embed failed (len={len(scene_text)} trimmed={len(scene_for_sem)}): {ex}")
-
-        if q_emb:
-            try:
-                tcoll = get_chroma_collection(chroma_host, chroma_port, trope_collection)
-                # do NOT request "ids" in include; Chroma returns ids by default
-                tres = tcoll.query(query_embeddings=[q_emb], n_results=trope_top_k, include=["metadatas"])
-                ids_from_catalog = (tres.get("ids") or [[]])[0] or []
-                for tid in ids_from_catalog:
-                    if tid:
-                        cand_ids.add(tid)
-            except Exception as ex:
-                print(f"[judge] warn: catalog query failed: {ex}")
-
-        avail_ids = sorted(list(cand_ids))
+        avail_ids = sorted(cand_ids)
         print(f"[judge] scene={scene_id[:8]} cand_after_catalog={len(avail_ids)}")
         if not avail_ids:
-            continue  # nothing to judge in this scene
+            continue
 
-        # --- 3) Two-stage rerank + sanity ---------------------------------
+        # -- rerank + sanity (writes scene_support, support_selection, trope_sanity) --
         support_ids, weights = choose_support_and_sanity(
             conn=conn,
             work_id=work_id,
@@ -421,111 +767,51 @@ def judge_scenes(
             persist=True,
         )
 
-        # Fetch chosen support texts (prefer chunk.text; fallback to work slice)
-        support_texts: List[str] = []
-        if support_ids:
-            q = conn.execute(
-                f"SELECT c.id, c.text, c.char_start, c.char_end, c.work_id "
-                f"FROM chunk c WHERE c.id IN ({','.join(['?']*len(support_ids))})",
-                tuple(support_ids)
-            ).fetchall()
-            by_id = {row[0]: row for row in q}
-            for cid in support_ids:
-                r = by_id.get(cid)
-                if not r:
-                    continue
-                txt = (r[1] or "").strip()
-                if not txt:
-                    W = conn.execute("SELECT norm_text FROM work WHERE id=?", (r[4],)).fetchone()
-                    if W and W[0]:
-                        cs, ce = int(r[2]), int(r[3])
-                        txt = W[0][cs:ce]
-                if txt:
-                    support_texts.append(txt[:480])
+        # -- support texts & meta (for prompt annotation) --
+        support_texts = _collect_support_texts(conn, support_ids)
+        support_meta  = _fetch_support_meta(conn, scene_id, support_ids)
 
-        # --- 4) Build trope definition block (annotated with prior weight) --
-        defs = []
-        qmarks = ",".join(["?"] * len(avail_ids))
-        rows = conn.execute(
-            f"SELECT id, name, summary FROM trope WHERE id IN ({qmarks})",
-            tuple(avail_ids)
-        ).fetchall()
-        for tid, name, summary in rows:
-            w = float(weights.get(tid, 1.0))
-            defs.append(f"- {tid} :: {name} — {summary or ''}  (PRIOR={w:.2f})")
+        # -- build prompt blocks --
+        defs_block     = _build_defs_block(conn, avail_ids, weights)
+        support_block  = _build_support_block(support_ids, support_texts, support_meta)
+        prior_json     = json.dumps({tid: round(float(weights.get(tid, 1.0)), 3) for tid in avail_ids})
 
-        # --- 5) Prompt ------------------------------------------------------
-        prior_json = json.dumps({tid: round(float(weights.get(tid, 1.0)), 3) for tid in avail_ids})
-        support_block = "\n\nSupport snippets (chosen via rerank):\n" + \
-                        ("\n---\n".join(support_texts) if support_texts else "(none)")
         prompt = (
             f"SYSTEM: {JUDGE_SYSTEM}\n\n"
             f"SCENE [chars {s}-{e}] (absolute offsets into work.norm_text):\n{scene_text[:2400]}\n"
             f"{support_block}\n\n"
-            f"CANDIDATE TROPES (id :: name — summary, annotated with PRIOR):\n" + ("\n".join(defs)) + "\n\n"
-            f"AVAILABLE_TROPE_IDS (use only these in output):\n" + json.dumps(avail_ids) + "\n\n"
-            f"PRIOR_WEIGHTS (hint; multiply your internal score by these priors):\n{prior_json}\n\n"
+            f"CANDIDATE TROPES (id :: name — summary, annotated with PRIOR):\n" + ("\n".join(defs_block)) + "\n\n"
+            f"AVAILABLE_TROPES (use only these ids):\n" + json.dumps(avail_ids) + "\n\n"
+            f"PRIOR_WEIGHTS (multiply your internal score by these priors):\n{prior_json}\n\n"
             + JUDGE_INSTRUCTIONS.replace("THRESHOLD", str(threshold))
-            + " Also: Use only values from AVAILABLE_TROPE_IDS for 'trope_id'. Do not invent new ids or names.\n"
+            + " Use only ids from AVAILABLE_TROPES for 'trope_id'."
         )
 
-        resp = call_reasoner(ollama_url, reasoner_model, prompt)
+        resp  = call_reasoner(ollama_url, reasoner_model, prompt)
         items = extract_json(resp)
         try:
-            print(f"[judge] scene={scene_id[:8]} cand={len(avail_ids)} support={len(support_texts)} items={len(items) if items else 0}")
+            print(f"[judge] scene={scene_id[:8]} cand={len(avail_ids)} support={len(support_ids or [])} items={len(items) if items else 0}")
         except Exception:
             pass
 
-        # --- 6) Insert findings (apply prior) ------------------------------
-        finding_cols = get_table_columns(conn, "trope_finding")
-        has_level = "level" in finding_cols
-
-        for it in items or []:
-            try:
-                tid = it["trope_id"]
-                raw_conf = float(it.get("confidence", 0.0))
-                w = float(weights.get(tid, 1.0))
-                adj_conf = max(0.0, min(1.0, raw_conf * w))
-                if adj_conf < threshold:
-                    continue
-
-                # clamp spans to valid range (absolute into work.norm_text)
-                span = it.get("evidence_char_span") or [s, min(e, s + len(scene_text))]
-                ev_s, ev_e = int(span[0]), int(span[1])
-                N = len(full_text)
-                ev_s = max(0, min(ev_s, N))
-                ev_e = max(0, min(ev_e, N))
-                if ev_e < ev_s:
-                    ev_s, ev_e = ev_e, ev_s
-
-                rationale = (it.get("rationale", "") or "").strip()
-                if w != 1.0:
-                    rationale = (rationale + f" [prior={w:.2f}, raw={raw_conf:.2f}, adj={adj_conf:.2f}]").strip()
-
-                fid = str(uuid.uuid4())
-                if has_level:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO trope_finding("
-                        " id, work_id, scene_id, chunk_id, trope_id, level, confidence,"
-                        " evidence_start, evidence_end, rationale, model)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (fid, work_id, scene_id, None, tid, "scene", adj_conf, ev_s, ev_e, rationale, reasoner_model)
-                    )
-                else:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO trope_finding("
-                        " id, work_id, scene_id, chunk_id, trope_id, confidence,"
-                        " evidence_start, evidence_end, rationale, model)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (fid, work_id, scene_id, None, tid, adj_conf, ev_s, ev_e, rationale, reasoner_model)
-                    )
-                inserted += 1
-            except Exception as e:
-                print(f"[judge] scene={scene_id[:8]} skip item due to error: {e}; item={it}")
-                continue
+        # -- upsert findings (apply prior; gate by per-trope threshold; tag run) --
+        inserted += _insert_findings(
+            conn=conn,
+            items=items or [],
+            weights=weights,
+            per_trope_thr=per_trope_thr,
+            default_thr=threshold,
+            reasoner_model=reasoner_model,
+            run_id=run_id,
+            work_id=work_id,
+            scene_id=scene_id,
+            s=s, e=e,
+            full_text=full_text,
+        )
 
     conn.commit()
     return inserted
+
 
 
 # ----------------------------- CLI -------------------------------------

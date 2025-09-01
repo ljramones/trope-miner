@@ -62,8 +62,9 @@ NOW     := $(shell date +%Y%m%d-%H%M%S)
         judge-verify-report \
         test-smoke \
         api-accept api-accept-latest api-edit-span api-edit-span-latest \
-        seed-boundary-no-anti \
-        seed-semantic
+        seed-boundary-no-anti seed-semantic \
+        heatmap learn-thresholds \
+        cooccur
 
 help:
 > echo "Targets:"
@@ -272,6 +273,10 @@ judge-verify-report:
 judge-fresh:
 > $(MAKE) clean
 > $(MAKE) judge
+
+learn-thresholds:
+> : $${DB:?set DB=./tropes.db}; \
+> python ingester/scripts/learn_thresholds.py --db "$$DB" --out out/trope_thresholds.csv
 
 dedupe:
 > $(SQLITE3) "DELETE FROM trope_candidate WHERE rowid NOT IN (SELECT MIN(rowid) FROM trope_candidate GROUP BY work_id, trope_id, start, end);"
@@ -514,3 +519,20 @@ verify-negation-dry:
 verify-negation:
 > python scripts/verifier_pass.py --db "$(DB)" --work-id "$(WORK_ID)" --mode downweight --window 40 --neg-downweight 0.6 --meta-downweight 0.75 --antialias-downweight 0.5
 
+heatmap:
+> mkdir -p out
+> : $${DB:?set DB=./tropes.db}; : $${WORK_ID:?set WORK_ID=<uuid>}; \
+> python scripts/heatmap.py \
+>   --db "$$DB" --work-id "$$WORK_ID" \
+>   --top-n $${TOP_N:-20} \
+>   --out-csv out/heatmap.csv \
+>   --out-png out/heatmap.png
+
+cooccur:
+> : $${DB:?set DB=./tropes.db}; : $${WORK_ID:?set WORK_ID=<uuid>}; \
+> TH=$${THRESHOLD:-0.25}; NOW=$$(date +%Y%m%d-%H%M%S); mkdir -p out; \
+> python scripts/cooccur.py --db "$$DB" --work-id "$$WORK_ID" \
+>   --threshold "$$TH" \
+>   --out-csv "out/cooccur.$$NOW.csv" \
+>   --out-graphml "out/cooccur.$$NOW.graphml" \
+>   --png "out/cooccur.$$NOW.png" --top-n 20 --min-weight 2

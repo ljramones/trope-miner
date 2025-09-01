@@ -4,7 +4,10 @@
 Rerank & sanity layer for Trope Miner.
 
 Pipeline:
-  1) Retrieve top-K chunk candidates (per-work) from Chroma.
+  1) Retrieve top-K chunk candidates from Chroma.
+     - If PER_WORK_COLLECTIONS=1: query collection "<CHUNK_COLLECTION>__<work_id>".
+       If it has no results, fall back to the global collection with where={"work_id": ...}.
+     - Else (default): query the global collection with where={"work_id": ...}.
   2) Ask a local LLM to pick the M most relevant snippets for judging.
      (We pass stage-1 KNN similarity and discourage generic background.)
   3) Persist selections:
@@ -31,6 +34,9 @@ import chromadb  # pip install chromadb
 
 
 # ----------------- env/config -----------------
+def _truthy(v: Optional[str]) -> bool:
+    return (v or "").strip().lower() in {"1", "true", "yes", "on"}
+
 OLLAMA = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 REASONER_MODEL = os.getenv("REASONER_MODEL", "llama3.1:8b")   # or qwen2.5:7b-instruct
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "nomic-embed-text")
@@ -38,6 +44,8 @@ EMBED_MODEL    = os.getenv("EMBED_MODEL", "nomic-embed-text")
 CHROMA_HOST    = os.getenv("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT    = int(os.getenv("CHROMA_PORT", "8000"))
 CHUNK_COLLECTION = os.getenv("CHUNK_COLLECTION", "trope-miner-v1-cos")
+PER_WORK_COLLECTIONS = _truthy(os.getenv("PER_WORK_COLLECTIONS", "0"))
+HNSW_SPACE = os.getenv("CHROMA_SPACE", "cosine")  # usually "cosine"
 
 # retrieval / rerank knobs
 TOP_K        = int(os.getenv("RERANK_TOP_K", "8"))            # first-stage K from Chroma
@@ -234,22 +242,41 @@ class ChunkHit:
 class ChunkRetriever:
     def __init__(self):
         self.client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-        # Ensure cosine space; no-op if already created that way
-        self.col = self.client.get_or_create_collection(
-            CHUNK_COLLECTION, metadata={"hnsw:space": "cosine"}
+        # Global collection (for fallback / default)
+        self.global_col = self.client.get_or_create_collection(
+            CHUNK_COLLECTION, metadata={"hnsw:space": HNSW_SPACE}
         )
+
+    def _per_work_collection(self, work_id: str):
+        """Return the per-work collection (creating if absent)."""
+        name = f"{CHUNK_COLLECTION}__{work_id}"
+        return self.client.get_or_create_collection(name, metadata={"hnsw:space": HNSW_SPACE})
+
+    def _query(self, col, q_emb, k: int, where: Optional[dict] = None) -> dict:
+        include = ["documents", "distances", "metadatas"]
+        if where:
+            return col.query(query_embeddings=[q_emb], n_results=k, include=include, where=where)
+        return col.query(query_embeddings=[q_emb], n_results=k, include=include)
 
     def topk_for_scene(self, work_id: str, scene_text: str, k: int = TOP_K) -> List[ChunkHit]:
-        """Return top-k hits (per-work) with text, distance, metadata."""
+        """Return top-k hits with text, distance, metadata (preferring per-work collection if enabled)."""
         [q_emb] = ollama_embed([scene_text])
 
-        # Valid include keys only (Chroma will always give ids)
-        res = self.col.query(
-            query_embeddings=[q_emb],
-            n_results=k,
-            where={"work_id": work_id},                 # per-work restriction
-            include=["documents", "distances", "metadatas"],
-        )
+        # Try per-work collection if toggled on
+        res = None
+        if PER_WORK_COLLECTIONS:
+            try:
+                pw_col = self._per_work_collection(work_id)
+                res = self._query(pw_col, q_emb, k)
+                ids_try = (res.get("ids") or [[]])[0] if isinstance(res.get("ids"), list) else []
+                if not ids_try:  # empty -> fall back to global w/ where
+                    res = None
+            except Exception:
+                res = None  # fall through to global
+
+        if res is None:
+            # Global collection with per-work filter
+            res = self._query(self.global_col, q_emb, k, where={"work_id": work_id})
 
         ids   = (res.get("ids") or [[]])[0]
         docs  = (res.get("documents") or [[]])[0]
@@ -457,7 +484,7 @@ def choose_support_and_sanity(
       - writes support_selection rows (rank + stage1/2 scores if those columns exist)
       - writes trope_sanity (lex_ok, sem_sim, weight) for each candidate trope
     """
-    # ---------------- Stage 1: per-work retrieval ----------------
+    # ---------------- Stage 1: retrieval ----------------
     retr = ChunkRetriever()
     hits = retr.topk_for_scene(work_id, scene_text, TOP_K)
 
@@ -496,4 +523,3 @@ def choose_support_and_sanity(
     # Return only the weights dict to the judge (default 1.0 if missing)
     weights_out = {tid: float(metrics.get(tid, {}).get("weight", 1.0)) for tid in candidate_trope_ids}
     return chosen_ids, weights_out
-

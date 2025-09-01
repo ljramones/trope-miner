@@ -3,11 +3,12 @@ set -euo pipefail
 trap 'echo "[error] line $LINENO: exit $?" >&2' ERR
 
 # =========================================
-# Trope Miner — One-shot ingest (A+B+C)
+# Trope Miner — One-shot ingest (A+B+C + 2A)
 # =========================================
-# A = span verification & tightening
-# B = negation / anti-pattern downweight
-# C = confidence calibration (uses human labels if present)
+# A  = span verification & tightening
+# B  = negation / anti-pattern downweight
+# C  = confidence calibration (uses human labels if present)
+# 2A = semantic seeding (recall without chaos)
 
 # --- Config ---
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +31,10 @@ CSV="${TROPES_CSV:-$ROOT/tropes_data/trope_seed.csv}"
 CHUNK_COLL="${CHUNK_COLL:-trope-miner-v1-cos}"
 TROPE_COLL="${TROPE_COLL:-trope-catalog-nomic-cos}"
 
-# Make these visible to the reranker/judge as env
+# Per-work collection toggle (7A)
+export PER_WORK_COLLECTIONS="${PER_WORK_COLLECTIONS:-0}"
+
+# Make base names visible to the reranker/judge as env (reranker derives per-work name if enabled)
 export CHUNK_COLLECTION="$CHUNK_COLL"
 export TROPE_COLLECTION="$TROPE_COLL"
 
@@ -64,16 +68,18 @@ EXPAND_ALIASES="${EXPAND_ALIASES:-0}"         # 1 to enable
 ALIAS_MODEL="${ALIAS_MODEL:-$REASONER_MODEL}"
 
 # --- 2A semantic seeding knobs ---
-SEM_TAU="${SEM_TAU:-0.70}"              # similarity threshold (1 - distance)
-SEM_TOP_N="${SEM_TOP_N:-8}"             # Chroma top-N per trope
-SEM_PER_SCENE_CAP="${SEM_PER_SCENE_CAP:-3}"  # max semantic seeds per (trope, scene)
+SEM_TAU="${SEM_TAU:-0.70}"                    # similarity threshold (1 - distance)
+SEM_TOP_N="${SEM_TOP_N:-8}"                   # Chroma top-N per trope
+SEM_PER_SCENE_CAP="${SEM_PER_SCENE_CAP:-3}"   # cap semantic seeds per (trope, scene)
 
-# --- C: calibration knobs (only if human labels exist) ---
-CALIB_BINS="${CALIB_BINS:-10}"
-CALIB_STEP="${CALIB_STEP:-0.01}"
-CALIB_OBJECTIVE="${CALIB_OBJECTIVE:-f1@precision}"  # f1 | f1@precision | precision@recall
-CALIB_MIN_PREC="${CALIB_MIN_PREC:-0.70}"
-CALIB_MIN_REC="${CALIB_MIN_REC:-0.10}"
+# --- Optional analytics ---
+GEN_HEATMAP="${GEN_HEATMAP:-0}"               # 1 to emit heatmap CSV/PNG
+GEN_COOCCUR="${GEN_COOCCUR:-0}"               # 1 to emit co-occur CSV/GraphML/PNG
+COOCC_TOP_N="${COOCC_TOP_N:-20}"
+COOCC_MIN_WEIGHT="${COOCC_MIN_WEIGHT:-1}"
+
+# --- Optional active learning (per-trope thresholds) ---
+LEARN_THRESHOLDS="${LEARN_THRESHOLDS:-0}"     # 1 to run learn_thresholds.py if present
 
 # ---------------- Sanity checks ----------------
 [[ -f "$TEXT" ]] || { echo "ERROR: Missing TEXT file: $TEXT" >&2; exit 1; }
@@ -118,10 +124,19 @@ python "$ROOT/ingestor_segmenter.py" ingest \
 WORK_ID="$(sqlite3 "$DB" 'SELECT id FROM work ORDER BY created_at DESC LIMIT 1;')"
 echo "==> WORK_ID=$WORK_ID"
 
+# Effective chunk collection (7A toggle)
+if [[ "$PER_WORK_COLLECTIONS" == "1" ]]; then
+  EFF_CHUNK_COLL="${CHUNK_COLL}__${WORK_ID}"
+  echo "==> PER_WORK_COLLECTIONS=1 → using per-work collection: ${EFF_CHUNK_COLL}"
+else
+  EFF_CHUNK_COLL="$CHUNK_COLL"
+  echo "==> PER_WORK_COLLECTIONS=0 → using global collection: ${EFF_CHUNK_COLL}"
+fi
+
 # ---------------- 3) Embed chunks ----------------------------
 python "$ROOT/embedder.py" \
   --db "$DB" \
-  --collection "$CHUNK_COLL" \
+  --collection "$EFF_CHUNK_COLL" \
   --model "$EMB_MODEL" \
   --chroma-host "$CHROMA_HOST" \
   --chroma-port "$CHROMA_PORT" \
@@ -132,7 +147,7 @@ set +e
 python "$ROOT/scripts/chroma_sanity.py" \
   --host "$CHROMA_HOST" \
   --port "$CHROMA_PORT" \
-  --collections "$CHUNK_COLL" "$TROPE_COLL" \
+  --collections "$EFF_CHUNK_COLL" "$TROPE_COLL" \
   --probe \
   --self-threshold 1e-3
 SANITY_RC=$?
@@ -155,37 +170,13 @@ else
     --work-id "$WORK_ID"
 fi
 
-# ---------------- 5b) Seed SEMANTIC candidates (recall without chaos) ---
-# Tunables (env overrides OK)
-SEM_TOPK="${SEM_TOPK:-8}"                 # per-trope top-N chunks
-SEM_MIN_SIM="${SEM_MIN_SIM:-0.70}"        # keep if (1 - distance) ≥ this
-SEM_MAX_PER="${SEM_MAX_PER:-3}"           # cap per (scene,trope) to avoid spam
-
-if [[ -f "$ROOT/scripts/seed_candidates_semantic.py" ]]; then
-  echo "==> Seeding semantic matches (top-n=${SEM_TOPK}, tau=${SEM_MIN_SIM})…"
-  python "$ROOT/scripts/seed_candidates_semantic.py" \
-    --db "$DB" \
-    --work-id "$WORK_ID" \
-    --collection "$CHUNK_COLL" \
-    --chroma-host "$CHROMA_HOST" \
-    --chroma-port "$CHROMA_PORT" \
-    --embed-model "$EMB_MODEL" \
-    --ollama-url "$OLLAMA_BASE_URL" \
-    --top-n "$SEM_TOPK" \
-    --tau "$SEM_MIN_SIM" \
-    --per-scene-cap "$SEM_MAX_PER"
-else
-  echo "==> Skipping semantic seeding (scripts/seed_candidates_semantic.py not found)"
-fi
-
-
-# ---------------- 5.5) Seed semantic candidates --------------
+# ---------------- 5.5) Seed semantic candidates (2A) --------
 if [[ -f "$ROOT/scripts/seed_candidates_semantic.py" ]]; then
   echo "==> Seeding semantic matches (tau=${SEM_TAU}, topN=${SEM_TOP_N}, cap/scene=${SEM_PER_SCENE_CAP})…"
   python "$ROOT/scripts/seed_candidates_semantic.py" \
     --db "$DB" \
     --work-id "$WORK_ID" \
-    --collection "$CHUNK_COLL" \
+    --collection "$EFF_CHUNK_COLL" \
     --chroma-host "$CHROMA_HOST" \
     --chroma-port "$CHROMA_PORT" \
     --embed-model "$EMB_MODEL" \
@@ -258,6 +249,30 @@ python "$ROOT/scripts/support_report.py" \
   --threshold "${THRESHOLD}" \
   --out "$OUT_DIR/support_${WORK_ID}.md" >/dev/null 2>&1 || true
 
+# ---------------- 7.5) Optional analytics --------------------
+if [[ "$GEN_HEATMAP" != "0" && -f "$ROOT/scripts/heatmap.py" ]]; then
+  echo "==> Heatmap (scenes × top-20 tropes)…"
+  python "$ROOT/scripts/heatmap.py" \
+    --db "$DB" \
+    --work-id "$WORK_ID" \
+    --csv "$OUT_DIR/heatmap_${WORK_ID}.csv" \
+    --png "$OUT_DIR/heatmap_${WORK_ID}.png" \
+    --top 20 || true
+fi
+
+if [[ "$GEN_COOCCUR" != "0" && -f "$ROOT/scripts/cooccur.py" ]]; then
+  echo "==> Co-occurrence graph…"
+  python "$ROOT/scripts/cooccur.py" \
+    --db "$DB" \
+    --work-id "$WORK_ID" \
+    --threshold "$THRESHOLD" \
+    --out-csv "$OUT_DIR/cooccur_${WORK_ID}.csv" \
+    --out-graphml "$OUT_DIR/cooccur_${WORK_ID}.graphml" \
+    --png "$OUT_DIR/cooccur_${WORK_ID}.png" \
+    --top-n "$COOCC_TOP_N" \
+    --min-weight "$COOCC_MIN_WEIGHT" || true
+fi
+
 # ---------------- 8) C: Calibration (if human labels exist) ---
 echo "==> Checking for human decisions (accept/reject)…"
 LABELED_COUNT="$(sqlite3 "$DB" "SELECT COUNT(*) FROM v_latest_human WHERE decision IN ('accept','reject');")"
@@ -281,11 +296,10 @@ if [ "${LABELED_COUNT}" -gt 0 ]; then
   set -e
 
   if [ "$CALIB_RC" -eq 0 ] && [ -f "$CALIB_CSV" ]; then
-    # grab "recommended_threshold,<value>" from CSV meta block
     REC_THR="$(grep -m1 '^recommended_threshold,' "$CALIB_CSV" | awk -F',' '{print $2}' | tr -d '[:space:]')"
     if [[ -n "${REC_THR:-}" && "$REC_THR" != "None" ]]; then
       echo "==> Calibration recommends THRESHOLD ≈ ${REC_THR}"
-      echo "    Use it on next runs, e.g.: THRESHOLD=${REC_THR} ./ingest_run.sh"
+      echo "    Use it on next runs, e.g.: THRESHOLD=${REC_THR} ./runingest.sh"
     else
       echo "[calib] No recommended threshold found in $CALIB_CSV (insufficient data?)."
     fi
@@ -294,6 +308,14 @@ if [ "${LABELED_COUNT}" -gt 0 ]; then
   fi
 else
   echo "==> No human labels yet; skipping calibration."
+fi
+
+# ---------------- 9) Optional: learn per-trope thresholds -----
+if [[ "$LEARN_THRESHOLDS" != "0" && -f "$ROOT/scripts/learn_thresholds.py" ]]; then
+  echo "==> Active learning: fitting per-trope thresholds…"
+  python "$ROOT/scripts/learn_thresholds.py" \
+    --db "$DB" \
+    --out "$OUT_DIR/trope_thresholds.csv" || true
 fi
 
 echo "Done. Findings → $OUT_DIR/findings.csv"
