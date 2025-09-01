@@ -1,0 +1,73 @@
+{% extends "layout.html" %}
+{% block title %}Review Queue{% endblock %}
+
+{% block body %}
+  <h2>Review Queue</h2>
+
+  <form class="toolbar" method="get" action="{{ url_for('queue') }}" style="display:flex; gap:.5rem; flex-wrap:wrap;">
+    <input type="text" name="work_id"  placeholder="work_id"  value="{{ filters.work_id or '' }}">
+    <input type="text" name="trope_id" placeholder="trope_id" value="{{ filters.trope_id or '' }}">
+    <input type="number" step="0.01" min="0" max="1" name="min_conf" placeholder="min_conf" value="{{ filters.min_conf if filters.min_conf is not none }}">
+    <input type="number" step="0.01" min="0" max="1" name="max_conf" placeholder="max_conf" value="{{ filters.max_conf if filters.max_conf is not none }}">
+    <select name="order">
+      {% set ord = (filters.order or 'uncertain') %}
+      <option value="uncertain" {{ 'selected' if ord=='uncertain' else '' }}>uncertain</option>
+      <option value="newest"    {{ 'selected' if ord=='newest'    else '' }}>newest</option>
+      <option value="highest"   {{ 'selected' if ord=='highest'   else '' }}>highest conf</option>
+    </select>
+    <button class="btn" type="submit">Apply</button>
+    <a class="btn" href="{{ url_for('index') }}">Back to Index</a>
+  </form>
+
+  {% if not candidate %}
+    <p><em>No unreviewed findings match the current filters.</em></p>
+  {% else %}
+    <div class="page">
+      <aside>
+        <div class="workHdr">{{ candidate.title }}</div>
+        <div class="meta">{{ candidate.author or "—" }} — Scene #{{ candidate.scene_idx }} · offset {{ offset }}</div>
+
+        <div class="toolbar">
+          <label><input type="checkbox" id="toggleAll" checked> show all highlights</label>
+        </div>
+
+        <div id="findingsList">
+          <div class="card finding"
+               data-fid="{{ candidate.id }}"
+               data-start="{{ candidate.start }}"
+               data-end="{{ candidate.end }}"
+               data-trope="{{ candidate.trope }}"
+               data-conf="{{ '%.2f'|format(candidate.confidence or 0) }}">
+            <h4>{{ candidate.trope }} <span class="nums">({{ '%.2f'|format(candidate.confidence or 0) }})</span></h4>
+            <div class="nums">[{{ candidate.start }} – {{ candidate.end }}]</div>
+            <div class="btnRow">
+              <button type="button" class="jump">Jump</button>
+              <button type="button" class="accept">Accept</button>
+              <button type="button" class="reject">Reject</button>
+              <button type="button" class="edit">Edit span</button>
+              <button type="button" class="next">Skip/Next</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div class="sceneWrap">
+          <pre id="text" data-offset="{{ offset|int }}">{{ scene_text }}</pre>
+          <script id="scene-text" type="application/json">{{ scene_text|tojson }}</script>
+        </div>
+      </section>
+    </div>
+
+    <script id="spans-json" type="application/json">{{ spans|tojson }}</script>
+    <script id="queue-meta" type="application/json">{{ {
+      "filters": filters, "current_fid": candidate.id
+    }|tojson }}</script>
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  {% if candidate %}
+    <script defer src="{{ url_for('static', filename='queue.js', v=1) }}"></script>
+  {% endif %}
+{% endblock %}

@@ -10,17 +10,17 @@ Usage
   $ export OLLAMA_BASE_URL=http://localhost:11434
   $ python embedder.py \
       --db ./tropes.db \
-      --collection trope-miner-v1 \
+      --collection trope-miner-v1-cos \
       --model nomic-embed-text \
       --chroma-host localhost --chroma-port 8000 \
       --batch-size 64 --limit 0
 
 Optionally verify with a query:
-  $ python embedder.py --db ./tropes.db --collection trope-miner-v1 \
+  $ python embedder.py --db ./tropes.db --collection trope-miner-v1-cos \
       --query "vengeful spirit stalking the night" --top-k 5
 
 Notes
-  • Canonical text lives in SQLite. Chroma stores vectors + metadata.
+  • Canonical text lives in SQLite. Chroma stores vectors + documents + metadata.
   • Idempotent per collection: skips chunks already in embedding_ref.
   • Safe to re-run; only new chunks are embedded.
 """
@@ -127,8 +127,6 @@ def get_chroma_collection(host: str, port: int, name: str, space: str = "cosine"
     except Exception:
         return client.create_collection(name, metadata={"hnsw:space": space})
 
-
-
 # ----------------------------- Main embed loop --------------------------
 
 def embed_and_upsert(
@@ -140,7 +138,7 @@ def embed_and_upsert(
     model: str,
     batch_size: int,
     limit: int,
-    space: str,   # <— added
+    space: str,
 ) -> None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -155,69 +153,63 @@ def embed_and_upsert(
     embedded_rows: List[Tuple[str, str, str, int, str]] = []
 
     ids: List[str] = []
+    docs: List[str] = []
     embs: List[List[float]] = []
     metas: List[Dict] = []
 
     def flush():
-        nonlocal ids, embs, metas, embedded_rows
+        nonlocal ids, docs, embs, metas, embedded_rows
         if not ids:
             return
 
-        # Defensive: keep triples aligned
-        if len(ids) != len(embs) or len(ids) != len(metas):
-            print(f"!! Skipping batch due to length mismatch: ids={len(ids)} embs={len(embs)} metas={len(metas)}")
-            ids.clear();
-            embs.clear();
-            metas.clear();
+        # Defensive: keep 4-tuples aligned
+        if not (len(ids) == len(embs) == len(metas) == len(docs)):
+            print(f"!! Skipping batch due to length mismatch: ids={len(ids)} embs={len(embs)} metas={len(metas)} docs={len(docs)}")
+            ids.clear(); embs.clear(); metas.clear(); docs.clear()
             return
 
         # Drop empties
-        triples = [(i, e, m) for i, e, m in zip(ids, embs, metas) if isinstance(e, list) and len(e) > 0]
-        if not triples:
+        quads = [(i, d, e, m) for i, d, e, m in zip(ids, docs, embs, metas) if isinstance(e, list) and len(e) > 0]
+        if not quads:
             print("!! Skipping batch: empty embeddings")
-            ids.clear();
-            embs.clear();
-            metas.clear();
+            ids.clear(); embs.clear(); metas.clear(); docs.clear()
             return
 
-        ids_f, embs_f, metas_f = zip(*triples)
+        ids_f, docs_f, embs_f, metas_f = zip(*quads)
 
         # Ensure consistent dimensionality
         dim = len(embs_f[0])
         if dim <= 0:
             print("!! Skipping batch: zero-length embedding")
-            ids.clear();
-            embs.clear();
-            metas.clear();
+            ids.clear(); embs.clear(); metas.clear(); docs.clear()
             return
 
-        keep = [(i, e, m) for (i, e, m) in zip(ids_f, embs_f, metas_f) if len(e) == dim]
+        keep = [(i, d, e, m) for (i, d, e, m) in zip(ids_f, docs_f, embs_f, metas_f) if len(e) == dim]
         if not keep:
             print("!! Skipping batch: inconsistent dims")
-            ids.clear();
-            embs.clear();
-            metas.clear();
+            ids.clear(); embs.clear(); metas.clear(); docs.clear()
             return
-        ids_f, embs_f, metas_f = zip(*keep)
+        ids_f, docs_f, embs_f, metas_f = zip(*keep)
 
-        # Upsert to Chroma
+        # Upsert to Chroma — include documents and metadata with chunk_id
         try:
-            coll.upsert(ids=list(ids_f), embeddings=list(embs_f), metadatas=list(metas_f))
+            coll.upsert(
+                ids=list(ids_f),
+                embeddings=list(embs_f),
+                documents=list(docs_f),
+                metadatas=list(metas_f),
+            )
         except Exception as e:
             print(f"!! Chroma upsert failed for batch of {len(ids_f)}: {e}")
-            ids.clear();
-            embs.clear();
-            metas.clear()
+            ids.clear(); embs.clear(); metas.clear(); docs.clear()
             return
 
-        # Stamp embedding_ref (mark success) — use the outer 'model' value
+        # Stamp embedding_ref (mark success)
         stamped = [(cid, collection, model, dim, cid) for cid in ids_f]
         mark_embedded(conn, stamped)
         embedded_rows.extend(stamped)
 
-        ids.clear();
-        embs.clear();
-        metas.clear()
+        ids.clear(); embs.clear(); metas.clear(); docs.clear()
 
     total = len(chunks)
     for i, ch in enumerate(chunks, 1):
@@ -228,8 +220,10 @@ def embed_and_upsert(
             continue
 
         ids.append(ch.id)
+        docs.append(ch.text if isinstance(ch.text, str) else "")
         embs.append(emb)
         metas.append({
+            "chunk_id": ch.id,        # <— helps retrieval map back to SQLite
             "work_id": ch.work_id,
             "scene_id": ch.scene_id,
             "chunk_idx": ch.idx,
@@ -255,12 +249,14 @@ def query_demo(chroma_host: str, chroma_port: int, collection: str,
                ollama_url: str, model: str, text: str, top_k: int, space: str):
     coll = get_chroma_collection(chroma_host, chroma_port, collection, space=space)
     q_emb = embed_text_ollama(ollama_url, model, text)
-    res = coll.query(query_embeddings=[q_emb], n_results=top_k, include=["metadatas", "distances"])
+    res = coll.query(query_embeddings=[q_emb], n_results=top_k, include=["metadatas", "documents", "distances"])
     ids = res.get("ids", [[]])[0]
+    docs = res.get("documents", [[]])[0]
     dists = res.get("distances", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
-    for rank, (cid, dist, meta) in enumerate(zip(ids, dists, metas), 1):
-        print(f"#{rank} id={cid} dist={dist:.4f} meta={meta}")
+    for rank, (cid, dist, meta, doc) in enumerate(zip(ids, dists, metas, docs), 1):
+        doc_preview = (doc or "")[:120].replace("\n", " ")
+        print(f"#{rank} id={cid} dist={dist:.4f} meta={meta} doc≈{doc_preview!r}")
 
 # ----------------------------- CLI -------------------------------------
 

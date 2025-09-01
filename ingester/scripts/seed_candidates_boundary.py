@@ -4,16 +4,24 @@ Seed trope candidates using word-boundary regex matches on chunk text.
 
 - Reads aliases from trope.aliases (JSON array) and ALSO uses the canonical trope name.
 - Skips ultra-generic/short aliases (stoplist + min length), BUT never drops the canonical name.
-- Uses chunk-local regex matches; converts to work-level offsets with chunk.char_start.
+- Converts chunk-local match offsets to work-level offsets with chunk.char_start.
 - Inserts into trope_candidate(
       id, work_id, scene_id, chunk_id, trope_id, surface, alias,
       start, end, source='gazetteer', score=0.0
   )
-- Idempotent across runs via a UNIQUE index on (work_id, trope_id, start, end).
+- Idempotent across runs via UNIQUE(work_id, trope_id, start, end).
+
+NEW:
+- If the DB has trope.anti_aliases (JSON array), we now:
+  (a) HARD BLOCK at the chunk level: if any anti-alias phrase appears anywhere
+      in the chunk, skip all candidates for that trope in that chunk.
+  (b) SOFT BLOCK in a local window: also skip matches that look like "anti-<alias>"
+      (flexible dash/space forms) near the hit, or if any anti-phrase is in-window.
 
 Usage:
   python scripts/seed_candidates_boundary.py --db ./tropes.db --work-id <UUID> \
-      [--min-len 5] [--max-per-trope 500] [--stoplist extra_stopwords.txt]
+      [--min-len 5] [--max-per-trope 500] [--stoplist extra_stopwords.txt] \
+      [--anti-window 60] [--no-anti]
 """
 
 import argparse
@@ -57,29 +65,46 @@ def load_stoplist(path: str) -> Set[str]:
 # ----------------------------------------------------------------------
 # DB access
 # ----------------------------------------------------------------------
+def _trope_has_column(conn: sqlite3.Connection, col: str) -> bool:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trope)")}
+    return col in cols
+
 def load_tropes(conn: sqlite3.Connection) -> List[Dict]:
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT id, name, aliases FROM trope ORDER BY name COLLATE NOCASE"
-    ).fetchall()
+    r"""Return [{id, name, aliases, anti_aliases}] (anti_aliases only if column exists)."""
+    has_aa = _trope_has_column(conn, "anti_aliases")
+    if has_aa:
+        rows = conn.execute(
+            "SELECT id, name, aliases, anti_aliases FROM trope ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, name, aliases, NULL as anti_aliases FROM trope ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+
     out: List[Dict] = []
-    for tid, name, aliases_json in rows:
+    for tid, name, aliases_json, anti_json in rows:
         aliases: List[str] = []
+        anti_aliases: List[str] = []
         if aliases_json:
             try:
                 arr = json.loads(aliases_json)
                 if isinstance(arr, list):
                     aliases = [a for a in arr if isinstance(a, str)]
             except Exception:
-                # ignore bad JSON
                 pass
-        out.append({"id": tid, "name": name, "aliases": aliases})
+        if anti_json:
+            try:
+                arr = json.loads(anti_json)
+                if isinstance(arr, list):
+                    anti_aliases = [a for a in arr if isinstance(a, str)]
+            except Exception:
+                pass
+        out.append({"id": tid, "name": name, "aliases": aliases, "anti_aliases": anti_aliases})
     return out
 
 
 def load_chunks(conn: sqlite3.Connection, work_id: str):
-    cur = conn.cursor()
-    rows = cur.execute(
+    rows = conn.execute(
         "SELECT id, scene_id, char_start, char_end, text "
         "FROM chunk WHERE work_id=? ORDER BY char_start ASC",
         (work_id,),
@@ -116,9 +141,8 @@ def alias_ok(alias: str, min_len: int) -> bool:
 # ----------------------------------------------------------------------
 _DASH_CLASS = r"[-\u2010-\u2015]"  # hyphen + Unicode hyphen/dash range
 
-
 def _escape_token(token: str) -> str:
-    """Escape a token and normalize punctuation variants (dashes, apostrophes)."""
+    r"""Escape a token and normalize punctuation variants (dashes, apostrophes)."""
     esc = re.escape(token)
     # Normalize hyphen/dash variants *inside* the token so alias “Face–Heel” matches Face-Heel/Face—Heel
     esc = (
@@ -165,6 +189,38 @@ def build_pattern(alias: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){core}(?!\w)", re.IGNORECASE)
 
 
+# -------- Anti-* helpers --------
+def _alias_core_from_pattern(pat: re.Pattern) -> str:
+    r"""Extract the 'core' from our canonical (?<!\w) CORE (?!\w) pattern."""
+    s = pat.pattern
+    prefix = r"(?<!\w)"
+    suffix = r"(?!\w)"
+    if s.startswith(prefix) and s.endswith(suffix):
+        return s[len(prefix): -len(suffix)]
+    return s  # fallback; still usable
+
+def build_anti_alias_regex(alias_pat: re.Pattern) -> re.Pattern:
+    r"""
+    Match anti-<alias> with flexible dashes/spaces:
+      (?<!\w) anti ([-–—]|\s)+ <core> (?!\w)
+    """
+    core = _alias_core_from_pattern(alias_pat)
+    return re.compile(rf"(?<!\w)anti(?:{_DASH_CLASS}|\s)+{core}(?!\w)", re.I)
+
+def compile_antialiases(phrases: List[str]) -> List[re.Pattern]:
+    out: List[re.Pattern] = []
+    for p in phrases or []:
+        p2 = p.strip()
+        if not p2:
+            continue
+        # plain substring-style but case-insensitive; escape to avoid regex tricks
+        out.append(re.compile(re.escape(p2), re.I))
+    return out
+
+# Pre-compile the "anti-" prefix detector used for window checks (perf)
+ANTI_EDGE = re.compile(rf"(?<!\w)anti(?:{_DASH_CLASS}|\s)+", re.I)
+
+
 # ----------------------------------------------------------------------
 # Indexes & uniqueness
 # ----------------------------------------------------------------------
@@ -186,13 +242,15 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
 # Main
 # ----------------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Seed candidates with word-boundary alias matching.")
+    ap = argparse.ArgumentParser(description="Seed candidates with word-boundary alias matching (+ anti-phrase suppression).")
     ap.add_argument("--db", required=True, help="Path to tropes.db")
     ap.add_argument("--work-id", required=True, help="Work UUID to scan")
     ap.add_argument("--min-len", type=int, default=5,
                     help="Minimum alias length for non-canonical aliases (default: 5)")
     ap.add_argument("--stoplist", help="Path to newline-delimited extra stopwords")
     ap.add_argument("--max-per-trope", type=int, default=500, help="Cap inserts per trope (safety)")
+    ap.add_argument("--anti-window", type=int, default=60, help="±chars around a hit to look for anti-phrases/anti-X")
+    ap.add_argument("--no-anti", action="store_true", help="Disable anti-alias / anti-X suppression")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -203,7 +261,6 @@ def main() -> None:
     chunks = load_chunks(conn, args.work_id)
 
     if args.stoplist:
-        # mutate in place to avoid needing 'global'
         STOPLIST.update(load_stoplist(args.stoplist))
 
     if not chunks:
@@ -212,6 +269,8 @@ def main() -> None:
 
     cur = conn.cursor()
     total_inserts = 0
+    total_blocked_anti_window = 0     # anti-X / anti-phrase inside near window
+    total_blocked_chunk_antialias = 0 # whole-chunk anti_alias presence
 
     for trope in tropes:
         tid = trope["id"]
@@ -221,25 +280,32 @@ def main() -> None:
         entries: List[Tuple[str, bool]] = [(canon, True)]
 
         # Add normalized non-canonical aliases
-        entries.extend((norm_alias(a), False) for a in trope["aliases"])
+        entries.extend((norm_alias(a), False) for a in (trope.get("aliases") or []))
 
         # Filter: keep canonical; apply stoplist/min_len to others
         alias_list: List[str] = []
         for alias, is_canon in entries:
             if not alias:
                 continue
-            if is_canon:
+            if is_canon or alias_ok(alias, args.min_len):
                 alias_list.append(alias)
-            else:
-                if alias_ok(alias, args.min_len):
-                    alias_list.append(alias)
 
         # Stable de-dup
         alias_list = list(dict.fromkeys(alias_list))
         if not alias_list:
             continue
 
-        compiled = [(a, build_pattern(a)) for a in alias_list]
+        # Precompile positive alias and corresponding anti-* regex
+        compiled: List[Tuple[str, re.Pattern, re.Pattern]] = []
+        for a in alias_list:
+            pat = build_pattern(a)
+            anti_pat = build_anti_alias_regex(pat)
+            compiled.append((a, pat, anti_pat))
+
+        # Per-trope anti-alias phrases (JSON list)
+        anti_alias_pats: List[re.Pattern] = []
+        if not args.no_anti:
+            anti_alias_pats = compile_antialiases(trope.get("anti_aliases") or [])
 
         per_trope = 0
         seen_spans: Set[Tuple[str, int, int]] = set()  # (trope_id, start, end)
@@ -253,17 +319,45 @@ def main() -> None:
             if not text:
                 continue
 
-            for alias, pat in compiled:
+            # ---- HARD BLOCK: if any anti_alias phrase appears in the whole chunk, skip this chunk for this trope
+            if not args.no_anti and anti_alias_pats:
+                if any(ap.search(text) for ap in anti_alias_pats):
+                    total_blocked_chunk_antialias += 1
+                    continue
+
+            # ---- Normal alias matching (with optional near-window anti checks)
+            for alias, pat, anti_pat in compiled:
                 for m in pat.finditer(text):
+                    # Work-absolute coordinates
                     start = ch_start + m.start()
                     end = ch_start + m.end()
                     key = (tid, start, end)
                     if key in seen_spans:
                         continue
-
-                    # sanity: ensure span fits inside the chunk’s range
+                    # Sanity: ensure span inside the chunk’s range
                     if start < ch_start or end > ch_end:
                         continue
+
+                    # ---- SOFT BLOCK: "anti-" phrasing near the match (anti-window)
+                    if not args.no_anti and args.anti_window and args.anti_window > 0:
+                        a0, a1 = m.span()
+                        w0 = max(0, a0 - args.anti_window)
+                        w1 = min(len(text), a1 + args.anti_window)
+                        window = text[w0:w1]
+
+                        blocked = False
+                        # anti-<alias> like "anti—whodunit" / "anti whodunit"
+                        if anti_pat.search(window) or ANTI_EDGE.search(window):
+                            blocked = True
+                        # user-provided anti-phrases
+                        if not blocked and anti_alias_pats:
+                            for ap in anti_alias_pats:
+                                if ap.search(window):
+                                    blocked = True
+                                    break
+                        if blocked:
+                            total_blocked_anti_window += 1
+                            continue  # skip insert
 
                     try:
                         cur.execute(
@@ -289,6 +383,9 @@ def main() -> None:
 
     conn.commit()
     print(f"Seeded {total_inserts} boundary-matched candidate hits for work {args.work_id}")
+    if not args.no_anti:
+        print(f"[anti] blocked near-match hits (window): {total_blocked_anti_window}")
+        print(f"[anti] blocked by anti_aliases (chunk-level): {total_blocked_chunk_antialias}")
     conn.close()
 
 
