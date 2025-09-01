@@ -9,8 +9,8 @@ Trope Miner ingests long-form text, finds narrative tropes with evidence spans, 
 * 📊 **Outputs**: HTML highlight report, CSV, heatmap, co-occurrence graph
 
 > Detailed, hands-on runbooks live in each subproject:
-> • **Ingestor**: [`ingester/RUNME.md`](ingester/Readme.md)
-> • **Review UI**: [`review/README.md`](review/Readme.md)
+> • **Ingestor**: [`ingester/Readme.md`](ingester/Readme.md)
+> • **Review UI**: [`review/Readme.md`](review/Readme.md)
 
 ---
 
