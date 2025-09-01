@@ -1,7 +1,3 @@
-Here’s a clean, ready-to-drop-in **RUNME.md** that matches your current pipeline (A+B+C + 2A semantic seeding), plus optional heatmap & co-occurrence steps.
-
----
-
 # RUNME.md — Trope Miner (One-Shot Ingest + Review)
 
 This doc shows how to run the full pipeline end-to-end and how to tweak it with environment variables. It covers:
